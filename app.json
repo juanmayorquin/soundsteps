@@ -1,7 +1,8 @@
 {
   "expo": {
-    "name": "soundsteps-tmp",
-    "slug": "soundsteps-tmp",
+    "name": "SoundSteps",
+    "slug": "soundsteps",
+    "scheme": "soundsteps",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -25,6 +26,10 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font"
+    ]
   }
 }
