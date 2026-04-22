@@ -9,8 +9,8 @@ import { useProgress } from '../../hooks/useProgress';
 
 const UNLOCK_HINTS: Record<ModuleId, string> = {
   detection: '',
-  discrimination: 'Completá Detección al 80% para desbloquear',
-  words: 'Completá Discriminación al 80% para desbloquear',
+  discrimination: 'Completa Detección al 80% para desbloquear',
+  words: 'Completa Discriminación al 80% para desbloquear',
 };
 
 export default function ExercisesScreen() {
@@ -27,7 +27,7 @@ export default function ExercisesScreen() {
       <ScrollView showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
           <Text style={styles.title}>Ejercicios</Text>
-          <Text style={styles.subtitle}>Elegí un módulo para comenzar tu sesión</Text>
+          <Text style={styles.subtitle}>Elige un módulo para comenzar tu sesión</Text>
         </View>
 
         {MODULES.map((module) => {

@@ -188,7 +188,7 @@ export default function DetectionScreen() {
 
       {/* Main content */}
       <View style={styles.main}>
-        <Text style={styles.mainTitle}>Escuchá con atención</Text>
+        <Text style={styles.mainTitle}>Escucha con atención</Text>
 
         {/* Level chip */}
         <View style={styles.levelChip}>
@@ -249,7 +249,7 @@ export default function DetectionScreen() {
           <Text style={styles.hint}>
             {canAnswer
               ? '¿Lo escuchaste?'
-              : 'Tocá el botón para escuchar el sonido'}
+              : 'Toca el botón para escuchar el sonido'}
           </Text>
         )}
       </View>

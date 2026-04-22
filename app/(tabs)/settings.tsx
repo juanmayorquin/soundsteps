@@ -14,7 +14,7 @@ export default function SettingsScreen() {
   const handleReset = () => {
     Alert.alert(
       'Resetear progreso',
-      '¿Esto eliminará todo tu historial de entrenamiento. ¿Estás seguro?',
+      'Esto eliminará todo tu historial de entrenamiento. ¿Estás seguro?',
       [
         { text: 'Cancelar', style: 'cancel' },
         {

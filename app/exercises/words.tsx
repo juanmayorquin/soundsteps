@@ -180,7 +180,7 @@ export default function WordsScreen() {
           <View style={styles.levelChip}>
             <Text style={styles.levelChipText}>Nivel {currentLevel}</Text>
           </View>
-          <Text style={styles.playTitle}>Escuchá y seleccioná la palabra</Text>
+          <Text style={styles.playTitle}>Escucha y selecciona la palabra</Text>
           <TouchableOpacity
             style={[styles.playBtn, (isPlaying) && styles.playBtnActive]}
             onPress={handlePlay}
@@ -203,7 +203,7 @@ export default function WordsScreen() {
         </View>
 
         {!hasPlayed && (
-          <Text style={styles.hint}>Tocá Reproducir para escuchar la palabra.</Text>
+          <Text style={styles.hint}>Toca Reproducir para escuchar la palabra.</Text>
         )}
 
         {/* Word Options Grid — 2 columns */}

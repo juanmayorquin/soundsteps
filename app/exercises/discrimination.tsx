@@ -158,7 +158,7 @@ export default function DiscriminationScreen() {
     const pct = Math.round((scoreRef.current / SESSION_TRIAL_COUNT) * 100);
     const levelCopy =
       levelChange === 'promoted' ? `¡Subiste al Nivel ${nextLevelResult}!` :
-      levelChange === 'demoted'  ? `Volviste al Nivel ${nextLevelResult}. ¡Seguís progresando!` :
+      levelChange === 'demoted'  ? `Volviste al Nivel ${nextLevelResult}. ¡Sigues progresando!` :
       `Mantuviste el Nivel ${nextLevelResult}. ¡Muy bien!`;
     return (
       <SafeAreaView style={styles.container}>
@@ -213,7 +213,7 @@ export default function DiscriminationScreen() {
 
         {/* Instruction */}
         <View style={styles.instruction}>
-          <Text style={styles.instructionTitle}>Escuchá atentamente</Text>
+          <Text style={styles.instructionTitle}>Escucha atentamente</Text>
           <Text style={styles.instructionSub}>¿Estos dos sonidos son iguales?</Text>
         </View>
 
@@ -279,10 +279,10 @@ export default function DiscriminationScreen() {
         {phase !== 'feedback' && !canAnswer && (
           <Text style={styles.hint}>
             {!hasPlayedA && !hasPlayedB
-              ? 'Escuchá los dos sonidos para responder'
+              ? 'Escucha los dos sonidos para responder'
               : !hasPlayedA
-                ? 'Escuchá el Sonido A'
-                : 'Escuchá el Sonido B'}
+                ? 'Escucha el Sonido A'
+                : 'Escucha el Sonido B'}
           </Text>
         )}
 
