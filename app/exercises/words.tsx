@@ -1,100 +1,140 @@
 import { MaterialIcons } from '@expo/vector-icons';
-import { Audio } from 'expo-av';
 import { router } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors } from '../../constants/Colors';
-import { WORD_SETS } from '../../constants/AudioContent';
+import { WORDS_LEVELS } from '../../constants/AudioContent';
+import { useAudio } from '../../hooks/useAudio';
 import { useProgress } from '../../hooks/useProgress';
+import { generateWordTrials, computeNextLevel, type WordTrial, type WordCard } from '../../lib/trials';
+import type { Level } from '../../constants/Modules';
 
-type AnswerState = 'idle' | 'correct' | 'incorrect';
+type Phase = 'idle' | 'playing' | 'waitingAnswer' | 'feedback' | 'done';
 
-const TOTAL = WORD_SETS.length;
+const SESSION_TRIAL_COUNT = 10;
 
 export default function WordsScreen() {
-  const [current, setCurrent] = useState(0);
+  const { progress, loading, isUnlocked, logTrial, updateLevel, recordSession } = useProgress();
+  const { play, playFeedback, isPlaying } = useAudio();
+
+  const currentLevel = progress.modules.words.currentLevel as Level;
+  const [trials, setTrials] = useState<WordTrial[]>([]);
+  const [trialIndex, setTrialIndex] = useState(0);
+  const [phase, setPhase] = useState<Phase>('idle');
   const [hasPlayed, setHasPlayed] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [answerState, setAnswerState] = useState<AnswerState>('idle');
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [lastCorrect, setLastCorrect] = useState<boolean | null>(null);
   const [score, setScore] = useState(0);
-  const [done, setDone] = useState(false);
-  const soundRef = useRef<Audio.Sound | null>(null);
-  const { recordSession } = useProgress();
+  const [levelChange, setLevelChange] = useState<'promoted' | 'demoted' | 'same'>('same');
+  const [nextLevelResult, setNextLevelResult] = useState<Level>(currentLevel);
+
+  const scoreRef = useRef(0);
   const startTime = useRef(Date.now());
-  const correctCount = useRef(0);
 
+  // Deep-link guard
   useEffect(() => {
-    Audio.setAudioModeAsync({ playsInSilentModeIOS: true });
-    return () => { soundRef.current?.unloadAsync(); };
-  }, []);
+    if (!loading && !isUnlocked('words')) {
+      router.replace('/(tabs)/exercises');
+    }
+  }, [loading, isUnlocked]);
 
-  const playWord = useCallback(async () => {
+  // Generate trials on mount
+  useEffect(() => {
+    if (!loading) {
+      const generated = generateWordTrials(currentLevel);
+      setTrials(generated);
+      scoreRef.current = 0;
+      startTime.current = Date.now();
+    }
+  }, [loading]);
+
+  const currentTrial = trials[trialIndex];
+
+  const handlePlay = useCallback(async () => {
     if (isPlaying) return;
-    const set = WORD_SETS[current];
-    const targetWord = set.words.find((w) => w.id === set.target);
-    if (!targetWord) return;
-    try {
-      if (soundRef.current) {
-        await soundRef.current.unloadAsync();
-        soundRef.current = null;
-      }
-      const { sound } = await Audio.Sound.createAsync(targetWord.file);
-      soundRef.current = sound;
-      setIsPlaying(true);
-      sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded && status.didJustFinish) {
-          setIsPlaying(false);
-          setHasPlayed(true);
-        }
-      });
-      await sound.playAsync();
-    } catch {
-      setIsPlaying(false);
-      setHasPlayed(true);
-    }
-  }, [current, isPlaying]);
+    setPhase('playing');
+    await play(currentTrial.targetFile);
+    setHasPlayed(true);
+    setPhase('waitingAnswer');
+  }, [isPlaying, play, currentTrial]);
 
-  const handleSelect = useCallback((wordId: string) => {
-    if (!hasPlayed || answerState !== 'idle') return;
-    const set = WORD_SETS[current];
-    setSelected(wordId);
-    const isCorrect = wordId === set.target;
-    if (isCorrect) {
-      correctCount.current += 1;
+
+  const handleSelect = useCallback(async (cardId: string) => {
+    if (phase !== 'waitingAnswer' || !hasPlayed || selectedId !== null) return;
+
+    const correct = cardId === currentTrial.targetId;
+    setSelectedId(cardId);
+    setLastCorrect(correct);
+
+    if (correct) {
+      scoreRef.current += 1;
       setScore((s) => s + 1);
-      setAnswerState('correct');
-    } else {
-      setAnswerState('incorrect');
     }
-    setTimeout(() => {
-      const next = current + 1;
-      if (next >= TOTAL) {
+
+    setPhase('feedback');
+    playFeedback(correct ? 'correct' : 'incorrect');
+
+    await logTrial('words', {
+      stimulusId: currentTrial.targetId,
+      level: currentLevel,
+      noiseVolume: WORDS_LEVELS[currentLevel].noiseVolume,
+      response: cardId,
+      correct,
+      timestamp: Date.now(),
+    });
+
+    setTimeout(async () => {
+      const nextIndex = trialIndex + 1;
+      if (nextIndex >= SESSION_TRIAL_COUNT) {
+        const result = computeNextLevel(currentLevel, scoreRef.current);
+        setLevelChange(result.changed);
+        setNextLevelResult(result.nextLevel);
+        await updateLevel('words', result.nextLevel);
         const minutes = Math.ceil((Date.now() - startTime.current) / 60000);
-        recordSession('words', correctCount.current, TOTAL, minutes);
-        setDone(true);
+        await recordSession('words', scoreRef.current, SESSION_TRIAL_COUNT, minutes);
+        setPhase('done');
       } else {
-        setCurrent(next);
-        setSelected(null);
-        setAnswerState('idle');
+        setTrialIndex(nextIndex);
         setHasPlayed(false);
+        setSelectedId(null);
+        setLastCorrect(null);
+        setPhase('idle');
       }
     }, 1300);
-  }, [current, hasPlayed, answerState, recordSession]);
+  }, [
+    phase, hasPlayed, selectedId, currentTrial, currentLevel, trialIndex,
+    logTrial, playFeedback, updateLevel, recordSession,
+  ]);
 
-  if (done) {
-    const pct = Math.round((score / TOTAL) * 100);
+  if (loading || trials.length === 0) {
+    return <SafeAreaView style={styles.container} />;
+  }
+
+  if (phase === 'done') {
+    const pct = Math.round((scoreRef.current / SESSION_TRIAL_COUNT) * 100);
+    const levelCopy =
+      levelChange === 'promoted' ? `¡Subiste a Nivel ${nextLevelResult}!` :
+      levelChange === 'demoted'  ? `Ajustamos a Nivel ${nextLevelResult} para que practiques mejor.` :
+      `Mantuviste Nivel ${nextLevelResult}.`;
+
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.doneContainer}>
           <MaterialIcons name="check-circle" size={64} color={Colors.green500} />
           <Text style={styles.doneTitle}>¡Sesión completada!</Text>
-          <Text style={styles.doneSubtitle}>{score} de {TOTAL} correctos</Text>
+          <Text style={styles.doneSubtitle}>{scoreRef.current} de {SESSION_TRIAL_COUNT} correctos</Text>
           <View style={styles.doneScore}>
             <Text style={styles.doneScoreNumber}>{pct}%</Text>
             <Text style={styles.doneScoreLabel}>Precisión</Text>
           </View>
+          <Text style={styles.levelCopy}>{levelCopy}</Text>
           <TouchableOpacity style={styles.doneBtn} onPress={() => router.back()}>
             <Text style={styles.doneBtnText}>Volver al inicio</Text>
           </TouchableOpacity>
@@ -103,12 +143,12 @@ export default function WordsScreen() {
     );
   }
 
-  const set = WORD_SETS[current];
+  const canPlay = phase === 'idle' || phase === 'waitingAnswer';
 
-  const getCardStyle = (wordId: string) => {
-    if (answerState === 'idle') return styles.wordCard;
-    if (wordId === set.target) return [styles.wordCard, styles.wordCardCorrect];
-    if (wordId === selected) return [styles.wordCard, styles.wordCardIncorrect];
+  const getCardStyle = (card: WordCard) => {
+    if (phase !== 'feedback') return styles.wordCard;
+    if (card.id === currentTrial.targetId) return [styles.wordCard, styles.wordCardCorrect];
+    if (card.id === selectedId) return [styles.wordCard, styles.wordCardIncorrect];
     return [styles.wordCard, styles.wordCardDimmed];
   };
 
@@ -119,56 +159,66 @@ export default function WordsScreen() {
         <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
           <MaterialIcons name="arrow-back" size={24} color={Colors.slate900} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Identificación de palabras</Text>
+        <Text style={styles.headerTitle}>Reconocimiento de palabras</Text>
         <View style={styles.backBtn} />
       </View>
 
       {/* Progress */}
       <View style={styles.progressSection}>
         <View style={styles.progressRow}>
-          <Text style={styles.progressLeft}>Ejercicio {current + 1} de {TOTAL}</Text>
-          <Text style={styles.progressRight}>{Math.round((current / TOTAL) * 100)}%</Text>
+          <Text style={styles.progressLeft}>Ejercicio {trialIndex + 1} de {SESSION_TRIAL_COUNT}</Text>
+          <Text style={styles.progressRight}>{Math.round((trialIndex / SESSION_TRIAL_COUNT) * 100)}%</Text>
         </View>
         <View style={styles.progressTrack}>
-          <View style={[styles.progressFill, { width: `${(current / TOTAL) * 100}%` }]} />
+          <View style={[styles.progressFill, { width: `${(trialIndex / SESSION_TRIAL_COUNT) * 100}%` }]} />
         </View>
       </View>
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
-        {/* Instruction + Play Button */}
+        {/* Level chip + play button */}
         <View style={styles.playSection}>
-          <Text style={styles.playTitle}>Escuchá y seleccioná la imagen correcta</Text>
+          <View style={styles.levelChip}>
+            <Text style={styles.levelChipText}>Nivel {currentLevel}</Text>
+          </View>
+          <Text style={styles.playTitle}>Escuchá y seleccioná la palabra</Text>
           <TouchableOpacity
-            style={[styles.playBtn, isPlaying && styles.playBtnActive]}
-            onPress={playWord}
+            style={[styles.playBtn, (isPlaying) && styles.playBtnActive]}
+            onPress={handlePlay}
+            disabled={!canPlay || isPlaying}
             activeOpacity={0.85}
           >
-            <View style={styles.playBtnInner} />
             <MaterialIcons
               name={isPlaying ? 'pause-circle-filled' : 'play-circle-fill'}
               size={32}
               color="#fff"
             />
-            <Text style={styles.playBtnText}>{isPlaying ? 'Reproduciendo...' : hasPlayed ? 'Reproducir de nuevo' : 'Reproducir audio'}</Text>
+            <Text style={styles.playBtnText}>
+              {isPlaying
+                ? 'Reproduciendo...'
+                : hasPlayed
+                  ? 'Reproducir de nuevo'
+                  : 'Reproducir'}
+            </Text>
           </TouchableOpacity>
         </View>
 
         {!hasPlayed && (
-          <Text style={styles.hint}>Tocá Reproducir audio para escuchar la palabra y seleccioná la imagen correcta.</Text>
+          <Text style={styles.hint}>Tocá Reproducir para escuchar la palabra.</Text>
         )}
 
-        {/* Word Options Grid */}
+        {/* Word Options Grid — 2 columns */}
         <View style={styles.grid}>
-          {set.words.map((word) => {
-            const isSelected = selected === word.id;
-            const isTarget = word.id === set.target;
-            const showCheck = answerState !== 'idle' && isTarget;
+          {currentTrial.cards.map((card) => {
+            const isTarget = card.id === currentTrial.targetId;
+            const isSelected = card.id === selectedId;
+            const showCheck = phase === 'feedback' && isTarget;
+
             return (
               <TouchableOpacity
-                key={word.id}
-                style={getCardStyle(word.id)}
-                onPress={() => handleSelect(word.id)}
-                disabled={!hasPlayed || answerState !== 'idle'}
+                key={card.id}
+                style={[getCardStyle(card), styles.gridCell]}
+                onPress={() => handleSelect(card.id)}
+                disabled={!hasPlayed || phase !== 'waitingAnswer'}
                 activeOpacity={0.8}
               >
                 {showCheck && (
@@ -176,36 +226,14 @@ export default function WordsScreen() {
                     <MaterialIcons name="check" size={16} color="#fff" />
                   </View>
                 )}
-                <View style={[styles.wordIconWrap, { backgroundColor: word.color }]}>
-                  <MaterialIcons name={word.icon as any} size={40} color={Colors.slate700} />
+                <View style={[styles.wordIconWrap, { backgroundColor: card.color }]}>
+                  <MaterialIcons name={card.icon as any} size={36} color={Colors.slate700} />
                 </View>
-                <View style={styles.wordInfo}>
-                  <Text style={styles.wordLabel}>{word.label}</Text>
-                  <Text style={styles.wordCategory}>{word.category}</Text>
-                </View>
+                <Text style={styles.wordLabel}>{card.label}</Text>
               </TouchableOpacity>
             );
           })}
         </View>
-
-        {/* Skip */}
-        <TouchableOpacity
-          style={styles.skipBtn}
-          onPress={() => {
-            const next = current + 1;
-            if (next >= TOTAL) {
-              recordSession('words', correctCount.current, TOTAL, 1);
-              setDone(true);
-            } else {
-              setCurrent(next);
-              setSelected(null);
-              setAnswerState('idle');
-              setHasPlayed(false);
-            }
-          }}
-        >
-          <Text style={styles.skipText}>Saltar ejercicio</Text>
-        </TouchableOpacity>
       </ScrollView>
     </SafeAreaView>
   );
@@ -271,12 +299,23 @@ const styles = StyleSheet.create({
   },
   playSection: {
     alignItems: 'center',
-    gap: 20,
-    paddingVertical: 24,
+    gap: 12,
+    paddingVertical: 20,
+  },
+  levelChip: {
+    backgroundColor: `${Colors.primary}18`,
+    paddingHorizontal: 14,
+    paddingVertical: 5,
+    borderRadius: 20,
+  },
+  levelChipText: {
+    fontFamily: 'Lexend_600SemiBold',
+    fontSize: 13,
+    color: Colors.primary,
   },
   playTitle: {
     fontFamily: 'Lexend_700Bold',
-    fontSize: 22,
+    fontSize: 20,
     color: Colors.slate900,
     textAlign: 'center',
     maxWidth: 260,
@@ -301,12 +340,6 @@ const styles = StyleSheet.create({
   playBtnActive: {
     backgroundColor: Colors.primaryDark,
   },
-  playBtnInner: {
-    position: 'absolute',
-    top: 0, left: 0, right: 0, bottom: 0,
-    backgroundColor: 'rgba(255,255,255,0.15)',
-    opacity: 0,
-  },
   playBtnText: {
     fontFamily: 'Lexend_700Bold',
     fontSize: 17,
@@ -322,14 +355,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
   },
   grid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 12,
   },
+  gridCell: {
+    width: '47%',
+  },
   wordCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
     backgroundColor: Colors.surfaceLight,
     borderRadius: 20,
-    padding: 12,
+    padding: 16,
+    alignItems: 'center',
+    gap: 10,
     borderWidth: 2,
     borderColor: 'transparent',
     shadowColor: '#000',
@@ -363,39 +401,17 @@ const styles = StyleSheet.create({
     zIndex: 10,
   },
   wordIconWrap: {
-    width: 72,
-    height: 72,
+    width: 64,
+    height: 64,
     borderRadius: 16,
     alignItems: 'center',
     justifyContent: 'center',
-    marginRight: 16,
-  },
-  wordInfo: {
-    flex: 1,
   },
   wordLabel: {
     fontFamily: 'Lexend_700Bold',
-    fontSize: 18,
+    fontSize: 16,
     color: Colors.slate900,
-  },
-  wordCategory: {
-    fontFamily: 'Lexend_400Regular',
-    fontSize: 13,
-    color: Colors.slate500,
-    marginTop: 2,
-  },
-  skipBtn: {
-    marginTop: 16,
-    alignSelf: 'center',
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    backgroundColor: Colors.slate100,
-    borderRadius: 12,
-  },
-  skipText: {
-    fontFamily: 'Lexend_500Medium',
-    fontSize: 13,
-    color: Colors.slate500,
+    textAlign: 'center',
   },
   doneContainer: {
     flex: 1,
@@ -433,6 +449,13 @@ const styles = StyleSheet.create({
     fontFamily: 'Lexend_500Medium',
     fontSize: 12,
     color: Colors.slate500,
+  },
+  levelCopy: {
+    fontFamily: 'Lexend_600SemiBold',
+    fontSize: 15,
+    color: Colors.slate700,
+    textAlign: 'center',
+    paddingHorizontal: 16,
   },
   doneBtn: {
     backgroundColor: Colors.primary,

@@ -3,37 +3,8 @@ import { router } from 'expo-router';
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors } from '../../constants/Colors';
+import { MODULES } from '../../constants/Modules';
 import { useProgress } from '../../hooks/useProgress';
-
-const MODULES = [
-  {
-    id: 'detection',
-    title: 'Detección de sonidos',
-    description: 'Identificá señales auditivas básicas',
-    icon: 'notifications' as const,
-    iconBg: '#dbeafe',
-    iconColor: Colors.primary,
-    route: '/exercises/detection',
-  },
-  {
-    id: 'discrimination',
-    title: 'Discriminación de sonidos',
-    description: 'Diferenciá entre distintos sonidos',
-    icon: 'graphic-eq' as const,
-    iconBg: '#ccfbf1',
-    iconColor: '#0d9488',
-    route: '/exercises/discrimination',
-  },
-  {
-    id: 'words',
-    title: 'Reconocimiento de palabras',
-    description: 'Practicá la comprensión del habla',
-    icon: 'record-voice-over' as const,
-    iconBg: '#ede9fe',
-    iconColor: '#7c3aed',
-    route: '/exercises/words',
-  },
-];
 
 export default function HomeScreen() {
   const { progress, getWeeklyAccuracy, getTodayMinutes, getModuleAccuracy } = useProgress();
@@ -126,7 +97,7 @@ export default function HomeScreen() {
         <View style={styles.modulesSection}>
           <Text style={styles.sectionTitle}>Módulos de entrenamiento</Text>
           {MODULES.map((module) => {
-            const acc = getModuleAccuracy(module.id as any);
+            const acc = getModuleAccuracy(module.id);
             return (
               <TouchableOpacity
                 key={module.id}
@@ -135,7 +106,7 @@ export default function HomeScreen() {
                 activeOpacity={0.8}
               >
                 <View style={[styles.moduleIcon, { backgroundColor: module.iconBg }]}>
-                  <MaterialIcons name={module.icon} size={24} color={module.iconColor} />
+                  <MaterialIcons name={module.icon as any} size={24} color={module.iconColor} />
                 </View>
                 <View style={styles.moduleInfo}>
                   <Text style={styles.moduleName}>{module.title}</Text>

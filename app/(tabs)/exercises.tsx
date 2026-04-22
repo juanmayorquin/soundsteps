@@ -1,51 +1,26 @@
 import { MaterialIcons } from '@expo/vector-icons';
-import { router } from 'expo-router';
+import { router, useFocusEffect } from 'expo-router';
+import { useCallback } from 'react';
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors } from '../../constants/Colors';
+import { MODULES, type ModuleId } from '../../constants/Modules';
 import { useProgress } from '../../hooks/useProgress';
 
-const MODULES = [
-  {
-    id: 'detection' as const,
-    title: 'Detección de sonidos',
-    description: 'Identificá si podés escuchar un sonido. Ejercicios sí/no para entrenar tu percepción auditiva.',
-    icon: 'notifications' as const,
-    iconBg: '#dbeafe',
-    iconColor: Colors.primary,
-    tag: 'Principiante',
-    tagColor: Colors.primary,
-    route: '/exercises/detection',
-    rounds: 10,
-  },
-  {
-    id: 'discrimination' as const,
-    title: 'Discriminación de sonidos',
-    description: 'Compará dos sonidos y decidí si son iguales o diferentes.',
-    icon: 'graphic-eq' as const,
-    iconBg: '#ccfbf1',
-    iconColor: '#0d9488',
-    tag: 'Intermedio',
-    tagColor: '#0d9488',
-    route: '/exercises/discrimination',
-    rounds: 15,
-  },
-  {
-    id: 'words' as const,
-    title: 'Reconocimiento de palabras',
-    description: 'Escuchá una palabra y seleccioná la imagen correcta entre tres opciones.',
-    icon: 'record-voice-over' as const,
-    iconBg: '#ede9fe',
-    iconColor: '#7c3aed',
-    tag: 'Avanzado',
-    tagColor: '#7c3aed',
-    route: '/exercises/words',
-    rounds: 10,
-  },
-];
+const UNLOCK_HINTS: Record<ModuleId, string> = {
+  detection: '',
+  discrimination: 'Completá Detección al 80% para desbloquear',
+  words: 'Completá Discriminación al 80% para desbloquear',
+};
 
 export default function ExercisesScreen() {
-  const { getModuleAccuracy } = useProgress();
+  const { getModuleAccuracy, isUnlocked, loading, reload } = useProgress();
+
+  useFocusEffect(useCallback(() => {
+    reload();
+  }, []));
+
+  if (loading) return <SafeAreaView style={styles.container} />;
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -57,41 +32,56 @@ export default function ExercisesScreen() {
 
         {MODULES.map((module) => {
           const acc = getModuleAccuracy(module.id);
+          const unlocked = isUnlocked(module.id);
+
           return (
             <TouchableOpacity
               key={module.id}
-              style={styles.card}
-              onPress={() => router.push(module.route as any)}
-              activeOpacity={0.8}
+              style={[styles.card, !unlocked && styles.cardLocked]}
+              onPress={unlocked ? () => router.push(module.route as any) : undefined}
+              activeOpacity={unlocked ? 0.8 : 1}
+              disabled={!unlocked}
             >
               <View style={styles.cardTop}>
                 <View style={[styles.iconBox, { backgroundColor: module.iconBg }]}>
-                  <MaterialIcons name={module.icon} size={32} color={module.iconColor} />
+                  <MaterialIcons name={module.icon as any} size={32} color={module.iconColor} />
                 </View>
-                <View style={[styles.tag, { borderColor: module.tagColor }]}>
-                  <Text style={[styles.tagText, { color: module.tagColor }]}>{module.tag}</Text>
-                </View>
+                {unlocked ? (
+                  <View style={[styles.tag, { borderColor: module.tagColor }]}>
+                    <Text style={[styles.tagText, { color: module.tagColor }]}>{module.tagLabel}</Text>
+                  </View>
+                ) : (
+                  <View style={styles.lockBadge}>
+                    <MaterialIcons name="lock" size={18} color={Colors.slate400} />
+                  </View>
+                )}
               </View>
 
               <Text style={styles.moduleName}>{module.title}</Text>
               <Text style={styles.moduleDesc}>{module.description}</Text>
 
-              <View style={styles.cardBottom}>
-                <View style={styles.meta}>
-                  <MaterialIcons name="format-list-numbered" size={14} color={Colors.slate400} />
-                  <Text style={styles.metaText}>{module.rounds} rondas</Text>
-                </View>
-                {acc > 0 && (
+              {!unlocked && UNLOCK_HINTS[module.id] ? (
+                <Text style={styles.lockedHint}>{UNLOCK_HINTS[module.id]}</Text>
+              ) : null}
+
+              {unlocked && (
+                <View style={styles.cardBottom}>
                   <View style={styles.meta}>
-                    <MaterialIcons name="trending-up" size={14} color={Colors.green500} />
-                    <Text style={[styles.metaText, { color: Colors.green500 }]}>{acc}% precisión</Text>
+                    <MaterialIcons name="format-list-numbered" size={14} color={Colors.slate400} />
+                    <Text style={styles.metaText}>{module.roundCount} rondas</Text>
                   </View>
-                )}
-                <View style={styles.startBtn}>
-                  <Text style={[styles.startText, { color: module.iconColor }]}>Iniciar</Text>
-                  <MaterialIcons name="arrow-forward" size={14} color={module.iconColor} />
+                  {acc > 0 && (
+                    <View style={styles.meta}>
+                      <MaterialIcons name="trending-up" size={14} color={Colors.green500} />
+                      <Text style={[styles.metaText, { color: Colors.green500 }]}>{acc}% precisión</Text>
+                    </View>
+                  )}
+                  <View style={styles.startBtn}>
+                    <Text style={[styles.startText, { color: module.iconColor }]}>Iniciar</Text>
+                    <MaterialIcons name="arrow-forward" size={14} color={module.iconColor} />
+                  </View>
                 </View>
-              </View>
+              )}
             </TouchableOpacity>
           );
         })}
@@ -136,6 +126,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.slate100,
   },
+  cardLocked: {
+    opacity: 0.5,
+  },
   cardTop: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -159,6 +152,14 @@ const styles = StyleSheet.create({
     fontFamily: 'Lexend_600SemiBold',
     fontSize: 11,
   },
+  lockBadge: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: Colors.slate100,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   moduleName: {
     fontFamily: 'Lexend_700Bold',
     fontSize: 18,
@@ -171,6 +172,12 @@ const styles = StyleSheet.create({
     color: Colors.slate500,
     lineHeight: 20,
     marginBottom: 16,
+  },
+  lockedHint: {
+    fontFamily: 'Lexend_400Regular',
+    fontSize: 12,
+    color: Colors.slate400,
+    marginTop: 8,
   },
   cardBottom: {
     flexDirection: 'row',

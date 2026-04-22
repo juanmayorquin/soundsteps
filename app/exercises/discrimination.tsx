@@ -1,133 +1,176 @@
 import { MaterialIcons } from '@expo/vector-icons';
-import { Audio } from 'expo-av';
 import { router } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+  Animated,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors } from '../../constants/Colors';
-import { DISCRIMINATION_PAIRS, NOISE_TRACKS } from '../../constants/AudioContent';
+import { DISCRIMINATION_LEVELS, NOISE_TRACKS, type DiscriminationPair } from '../../constants/AudioContent';
+import { useAudio } from '../../hooks/useAudio';
 import { useProgress } from '../../hooks/useProgress';
+import { generateDiscriminationTrials, computeNextLevel, type DiscriminationTrial } from '../../lib/trials';
+import type { Level } from '../../constants/Modules';
 
-type NoiseLevel = 'off' | 'low' | 'medium' | 'high';
-type FeedbackState = 'idle' | 'correct' | 'incorrect';
+type Phase = 'idle' | 'playingA' | 'playingB' | 'bothPlayed' | 'feedback' | 'done';
 
-const TOTAL = DISCRIMINATION_PAIRS.length;
+const SESSION_TRIAL_COUNT = 10;
 
 export default function DiscriminationScreen() {
-  const [current, setCurrent] = useState(0);
-  const [playedA, setPlayedA] = useState(false);
-  const [playedB, setPlayedB] = useState(false);
-  const [playingId, setPlayingId] = useState<'A' | 'B' | null>(null);
-  const [noiseLevel, setNoiseLevel] = useState<NoiseLevel>('off');
-  const [feedback, setFeedback] = useState<FeedbackState>('idle');
+  const { progress, loading, isUnlocked, logTrial, updateLevel, recordSession } = useProgress();
+  const { play, playFeedback, playNoise, stopNoise, isPlaying } = useAudio();
+
+  const currentLevel = progress.modules.discrimination.currentLevel as Level;
+  const [trials, setTrials] = useState<DiscriminationTrial[]>([]);
+  const [trialIndex, setTrialIndex] = useState(0);
+  const [phase, setPhase] = useState<Phase>('idle');
+  const [hasPlayedA, setHasPlayedA] = useState(false);
+  const [hasPlayedB, setHasPlayedB] = useState(false);
+  const [lastCorrect, setLastCorrect] = useState<boolean | null>(null);
   const [score, setScore] = useState(0);
-  const [done, setDone] = useState(false);
-  const soundRef = useRef<Audio.Sound | null>(null);
-  const noiseRef = useRef<Audio.Sound | null>(null);
-  const { recordSession } = useProgress();
+  const [levelChange, setLevelChange] = useState<'promoted' | 'demoted' | 'same'>('same');
+  const [nextLevelResult, setNextLevelResult] = useState<Level>(currentLevel);
+
+  const scoreRef = useRef(0);
   const startTime = useRef(Date.now());
-  const correctCount = useRef(0);
+  const noiseStarted = useRef(false);
+  const feedbackAnim = useRef(new Animated.Value(0)).current;
 
+  // Deep-link guard
   useEffect(() => {
-    Audio.setAudioModeAsync({ playsInSilentModeIOS: true });
-    return () => {
-      soundRef.current?.unloadAsync();
-      noiseRef.current?.unloadAsync();
-    };
-  }, []);
-
-  const stopNoise = useCallback(async () => {
-    if (noiseRef.current) {
-      await noiseRef.current.stopAsync();
-      await noiseRef.current.unloadAsync();
-      noiseRef.current = null;
+    if (!loading && !isUnlocked('discrimination')) {
+      router.replace('/(tabs)/exercises');
     }
-  }, []);
+  }, [loading, isUnlocked]);
 
-  const startNoise = useCallback(async (level: NoiseLevel) => {
-    if (level === 'off') return;
-    await stopNoise();
-    try {
-      const file = NOISE_TRACKS[level];
-      const { sound } = await Audio.Sound.createAsync(file, { isLooping: true, volume: level === 'low' ? 0.2 : level === 'medium' ? 0.5 : 0.85 });
-      noiseRef.current = sound;
-      await sound.playAsync();
-    } catch { /* skip */ }
-  }, [stopNoise]);
+  // Generate trials and start noise on mount
+  useEffect(() => {
+    if (!loading) {
+      const generated = generateDiscriminationTrials(currentLevel);
+      setTrials(generated);
+      scoreRef.current = 0;
+      startTime.current = Date.now();
 
-  const handleNoiseLevelChange = useCallback(async (level: NoiseLevel) => {
-    setNoiseLevel(level);
-    if (level === 'off') {
-      await stopNoise();
-    } else {
-      await startNoise(level);
-    }
-  }, [stopNoise, startNoise]);
-
-  const playTrack = useCallback(async (which: 'A' | 'B') => {
-    if (playingId) return;
-    try {
-      if (soundRef.current) {
-        await soundRef.current.unloadAsync();
-        soundRef.current = null;
+      const levelCfg = DISCRIMINATION_LEVELS[currentLevel];
+      if (!noiseStarted.current && levelCfg.noiseVolume > 0) {
+        noiseStarted.current = true;
+        const noiseTrack =
+          currentLevel === 1 ? NOISE_TRACKS.low :
+          currentLevel === 2 ? NOISE_TRACKS.medium :
+          NOISE_TRACKS.high;
+        playNoise(noiseTrack, levelCfg.noiseVolume);
       }
-      const file = which === 'A' ? DISCRIMINATION_PAIRS[current].soundA : DISCRIMINATION_PAIRS[current].soundB;
-      const { sound } = await Audio.Sound.createAsync(file);
-      soundRef.current = sound;
-      setPlayingId(which);
-      sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded && status.didJustFinish) {
-          setPlayingId(null);
-          if (which === 'A') setPlayedA(true);
-          else setPlayedB(true);
-        }
-      });
-      await sound.playAsync();
-    } catch {
-      setPlayingId(null);
-      if (which === 'A') setPlayedA(true);
-      else setPlayedB(true);
     }
-  }, [current, playingId]);
+  }, [loading]);
 
-  const handleAnswer = useCallback((answer: 'same' | 'different') => {
-    if (feedback !== 'idle') return;
-    if (!playedA || !playedB) return;
-    const pair = DISCRIMINATION_PAIRS[current];
-    const isCorrect = (answer === 'same') === pair.isSame;
-    if (isCorrect) {
-      correctCount.current += 1;
+  const currentTrial = trials[trialIndex];
+
+  const animateFeedback = useCallback(() => {
+    feedbackAnim.setValue(0);
+    Animated.timing(feedbackAnim, { toValue: 1, duration: 300, useNativeDriver: true }).start();
+  }, [feedbackAnim]);
+
+  const handlePlayA = useCallback(async () => {
+    if (isPlaying) return;
+    setPhase('playingA');
+    await play(currentTrial.soundA);
+    // hasPlayedA is set in the isPlaying useEffect when playback actually ends
+  }, [isPlaying, play, currentTrial]);
+
+  const handlePlayB = useCallback(async () => {
+    if (isPlaying) return;
+    setPhase('playingB');
+    await play(currentTrial.soundB);
+    // hasPlayedB is set in the isPlaying useEffect when playback actually ends
+  }, [isPlaying, play, currentTrial]);
+
+  // Detect playback end during playingA/playingB
+  useEffect(() => {
+    if (!isPlaying) {
+      if (phase === 'playingA') {
+        setHasPlayedA(true);
+        setPhase(hasPlayedB ? 'bothPlayed' : 'idle');
+      } else if (phase === 'playingB') {
+        setHasPlayedB(true);
+        setPhase(hasPlayedA ? 'bothPlayed' : 'idle');
+      }
+    }
+  }, [isPlaying]);
+
+  const handleAnswer = useCallback(async (answer: 'same' | 'different') => {
+    if (phase !== 'bothPlayed') return;
+    if (!hasPlayedA || !hasPlayedB) return;
+
+    const correct = answer === currentTrial.correctAnswer;
+
+    if (correct) {
+      scoreRef.current += 1;
       setScore((s) => s + 1);
     }
-    setFeedback(isCorrect ? 'correct' : 'incorrect');
+    setLastCorrect(correct);
+
+    setPhase('feedback');
+    animateFeedback();
+    playFeedback(correct ? 'correct' : 'incorrect');
+
+    await logTrial('discrimination', {
+      stimulusId: currentTrial.pairId,
+      level: currentLevel,
+      noiseVolume: DISCRIMINATION_LEVELS[currentLevel].noiseVolume,
+      response: answer,
+      correct,
+      timestamp: Date.now(),
+    });
+
     setTimeout(async () => {
-      const next = current + 1;
-      if (next >= TOTAL) {
+      const nextIndex = trialIndex + 1;
+      if (nextIndex >= SESSION_TRIAL_COUNT) {
         await stopNoise();
+        const result = computeNextLevel(currentLevel, scoreRef.current);
+        setLevelChange(result.changed);
+        setNextLevelResult(result.nextLevel);
+        await updateLevel('discrimination', result.nextLevel);
         const minutes = Math.ceil((Date.now() - startTime.current) / 60000);
-        recordSession('discrimination', correctCount.current, TOTAL, minutes);
-        setDone(true);
+        await recordSession('discrimination', scoreRef.current, SESSION_TRIAL_COUNT, minutes);
+        setPhase('done');
       } else {
-        setCurrent(next);
-        setPlayedA(false);
-        setPlayedB(false);
-        setFeedback('idle');
+        setTrialIndex(nextIndex);
+        setHasPlayedA(false);
+        setHasPlayedB(false);
+        setLastCorrect(null);
+        setPhase('idle');
       }
     }, 1200);
-  }, [current, feedback, playedA, playedB, stopNoise, recordSession]);
+  }, [
+    phase, hasPlayedA, hasPlayedB, currentTrial, currentLevel, trialIndex,
+    logTrial, playFeedback, stopNoise, updateLevel, recordSession, animateFeedback,
+  ]);
 
-  if (done) {
-    const pct = Math.round((score / TOTAL) * 100);
+  if (loading || trials.length === 0) {
+    return <SafeAreaView style={styles.container} />;
+  }
+
+  if (phase === 'done') {
+    const pct = Math.round((scoreRef.current / SESSION_TRIAL_COUNT) * 100);
+    const levelCopy =
+      levelChange === 'promoted' ? `¡Subiste al Nivel ${nextLevelResult}!` :
+      levelChange === 'demoted'  ? `Volviste al Nivel ${nextLevelResult}. ¡Seguís progresando!` :
+      `Mantuviste el Nivel ${nextLevelResult}. ¡Muy bien!`;
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.doneContainer}>
           <MaterialIcons name="check-circle" size={64} color={Colors.green500} />
           <Text style={styles.doneTitle}>¡Sesión completada!</Text>
-          <Text style={styles.doneSubtitle}>{score} de {TOTAL} correctos</Text>
+          <Text style={styles.doneSubtitle}>{scoreRef.current} de {SESSION_TRIAL_COUNT} correctos</Text>
           <View style={styles.doneScore}>
             <Text style={styles.doneScoreNumber}>{pct}%</Text>
             <Text style={styles.doneScoreLabel}>Precisión</Text>
           </View>
+          <Text style={styles.levelCopy}>{levelCopy}</Text>
           <TouchableOpacity style={styles.doneBtn} onPress={() => router.back()}>
             <Text style={styles.doneBtnText}>Volver al inicio</Text>
           </TouchableOpacity>
@@ -136,7 +179,7 @@ export default function DiscriminationScreen() {
     );
   }
 
-  const canAnswer = playedA && playedB && feedback === 'idle';
+  const canAnswer = phase === 'bothPlayed';
 
   return (
     <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
@@ -146,9 +189,7 @@ export default function DiscriminationScreen() {
           <MaterialIcons name="arrow-back" size={24} color={Colors.slate900} />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Discriminación de sonidos</Text>
-        <TouchableOpacity style={styles.backBtn}>
-          <MaterialIcons name="info-outline" size={22} color={Colors.slate400} />
-        </TouchableOpacity>
+        <View style={styles.backBtn} />
       </View>
 
       <View style={styles.content}>
@@ -156,10 +197,17 @@ export default function DiscriminationScreen() {
         <View style={styles.progressSection}>
           <View style={styles.progressRow}>
             <Text style={styles.progressLabel}>PROGRESO</Text>
-            <Text style={styles.progressCount}>Intento {current + 1} de {TOTAL}</Text>
+            <Text style={styles.progressCount}>Intento {trialIndex + 1} de {SESSION_TRIAL_COUNT}</Text>
           </View>
           <View style={styles.progressTrack}>
-            <View style={[styles.progressFill, { width: `${((current) / TOTAL) * 100}%` }]} />
+            <View style={[styles.progressFill, { width: `${(trialIndex / SESSION_TRIAL_COUNT) * 100}%` }]} />
+          </View>
+        </View>
+
+        {/* Level chip */}
+        <View style={styles.levelChipRow}>
+          <View style={styles.levelChip}>
+            <Text style={styles.levelChipText}>Nivel {currentLevel}</Text>
           </View>
         </View>
 
@@ -171,47 +219,71 @@ export default function DiscriminationScreen() {
 
         {/* Playback Cards */}
         <View style={styles.playbackRow}>
-          {(['A', 'B'] as const).map((which) => {
-            const played = which === 'A' ? playedA : playedB;
-            const isActive = playingId === which;
-            return (
-              <TouchableOpacity
-                key={which}
-                style={[styles.soundCard, isActive && styles.soundCardActive]}
-                onPress={() => playTrack(which)}
-                activeOpacity={0.8}
-              >
-                <View style={[styles.playCircle, isActive && styles.playCircleActive]}>
-                  <MaterialIcons
-                    name={isActive ? 'pause' : 'play-arrow'}
-                    size={32}
-                    color={Colors.primary}
-                  />
-                </View>
-                <Text style={styles.soundLabel}>Sonido {which}</Text>
-                <Text style={styles.soundPhoneme}>
-                  {which === 'A' ? DISCRIMINATION_PAIRS[current].labelA : DISCRIMINATION_PAIRS[current].labelB}
-                </Text>
-                {played && (
-                  <View style={styles.playedDot} />
-                )}
-              </TouchableOpacity>
-            );
-          })}
+          {/* Sound A */}
+          <TouchableOpacity
+            style={[styles.soundCard, phase === 'playingA' && styles.soundCardActive]}
+            onPress={handlePlayA}
+            activeOpacity={0.8}
+            disabled={phase === 'feedback' || phase === 'done'}
+          >
+            <View style={[styles.playCircle, phase === 'playingA' && styles.playCircleActive]}>
+              <MaterialIcons
+                name={phase === 'playingA' ? 'pause' : 'play-arrow'}
+                size={32}
+                color={Colors.primary}
+              />
+            </View>
+            <Text style={styles.soundLabel}>Sonido A</Text>
+            {hasPlayedA && <View style={styles.playedDot} />}
+          </TouchableOpacity>
+
+          {/* Sound B */}
+          <TouchableOpacity
+            style={[styles.soundCard, phase === 'playingB' && styles.soundCardActive]}
+            onPress={handlePlayB}
+            activeOpacity={0.8}
+            disabled={phase === 'feedback' || phase === 'done'}
+          >
+            <View style={[styles.playCircle, phase === 'playingB' && styles.playCircleActive]}>
+              <MaterialIcons
+                name={phase === 'playingB' ? 'pause' : 'play-arrow'}
+                size={32}
+                color={Colors.primary}
+              />
+            </View>
+            <Text style={styles.soundLabel}>Sonido B</Text>
+            {hasPlayedB && <View style={styles.playedDot} />}
+          </TouchableOpacity>
         </View>
 
         {/* Feedback */}
-        {feedback !== 'idle' && (
-          <View style={[styles.feedbackBanner, { backgroundColor: feedback === 'correct' ? '#dcfce7' : '#fee2e2' }]}>
+        {phase === 'feedback' && (
+          <Animated.View
+            style={[
+              styles.feedbackBanner,
+              { opacity: feedbackAnim, backgroundColor: lastCorrect ? '#dcfce7' : '#fee2e2' },
+            ]}
+          >
             <MaterialIcons
-              name={feedback === 'correct' ? 'check-circle' : 'cancel'}
+              name={lastCorrect ? 'check-circle' : 'cancel'}
               size={18}
-              color={feedback === 'correct' ? Colors.green500 : Colors.red400}
+              color={lastCorrect ? Colors.green500 : Colors.red400}
             />
-            <Text style={[styles.feedbackText, { color: feedback === 'correct' ? Colors.green500 : Colors.red400 }]}>
-              {feedback === 'correct' ? '¡Correcto!' : 'No era — ¡siguiente ronda!'}
+            <Text style={[styles.feedbackText, { color: lastCorrect ? Colors.green500 : Colors.red400 }]}>
+              {lastCorrect ? '¡Correcto!' : 'No era — ¡siguiente ronda!'}
             </Text>
-          </View>
+          </Animated.View>
+        )}
+
+        {/* Hint when not both played */}
+        {phase !== 'feedback' && !canAnswer && (
+          <Text style={styles.hint}>
+            {!hasPlayedA && !hasPlayedB
+              ? 'Escuchá los dos sonidos para responder'
+              : !hasPlayedA
+                ? 'Escuchá el Sonido A'
+                : 'Escuchá el Sonido B'}
+          </Text>
         )}
 
         {/* Answer Buttons */}
@@ -234,34 +306,6 @@ export default function DiscriminationScreen() {
             <MaterialIcons name="cancel" size={20} color={Colors.slate700} />
             <Text style={[styles.answerBtnText, { color: Colors.slate700 }]}>Diferente</Text>
           </TouchableOpacity>
-        </View>
-
-        {/* Noise Control */}
-        <View style={styles.noiseSection}>
-          <View style={styles.noiseHeader}>
-            <View style={styles.noiseHeaderLeft}>
-              <MaterialIcons name="graphic-eq" size={18} color={Colors.primary} />
-              <Text style={styles.noiseLabel}>Ruido de fondo</Text>
-            </View>
-            {noiseLevel !== 'off' && (
-              <View style={styles.noiseBadge}>
-                <Text style={styles.noiseBadgeText}>{{ off: 'Sin ruido', low: 'Bajo', medium: 'Medio', high: 'Alto' }[noiseLevel]}</Text>
-              </View>
-            )}
-          </View>
-          <View style={styles.noiseControls}>
-            {(['off', 'low', 'medium', 'high'] as NoiseLevel[]).map((level) => (
-              <TouchableOpacity
-                key={level}
-                style={[styles.noiseBtn, noiseLevel === level && styles.noiseBtnActive]}
-                onPress={() => handleNoiseLevelChange(level)}
-              >
-                <Text style={[styles.noiseBtnText, noiseLevel === level && styles.noiseBtnTextActive]}>
-                  {({ off: 'Sin ruido', low: 'Bajo', medium: 'Medio', high: 'Alto' } as Record<NoiseLevel, string>)[level]}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
         </View>
       </View>
     </SafeAreaView>
@@ -302,7 +346,7 @@ const styles = StyleSheet.create({
     paddingTop: 16,
   },
   progressSection: {
-    marginBottom: 24,
+    marginBottom: 16,
   },
   progressRow: {
     flexDirection: 'row',
@@ -331,13 +375,28 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.primary,
     borderRadius: 4,
   },
+  levelChipRow: {
+    alignItems: 'flex-start',
+    marginBottom: 12,
+  },
+  levelChip: {
+    backgroundColor: `${Colors.primary}18`,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 20,
+  },
+  levelChipText: {
+    fontFamily: 'Lexend_600SemiBold',
+    fontSize: 12,
+    color: Colors.primary,
+  },
   instruction: {
-    marginBottom: 24,
+    marginBottom: 20,
     alignItems: 'center',
   },
   instructionTitle: {
     fontFamily: 'Lexend_700Bold',
-    fontSize: 24,
+    fontSize: 22,
     color: Colors.slate900,
   },
   instructionSub: {
@@ -355,9 +414,9 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: Colors.surfaceLight,
     borderRadius: 20,
-    padding: 24,
+    padding: 20,
     alignItems: 'center',
-    gap: 12,
+    gap: 10,
     borderWidth: 2,
     borderColor: 'transparent',
     shadowColor: Colors.primary,
@@ -382,14 +441,8 @@ const styles = StyleSheet.create({
   },
   soundLabel: {
     fontFamily: 'Lexend_600SemiBold',
-    fontSize: 15,
+    fontSize: 14,
     color: Colors.slate700,
-  },
-  soundPhoneme: {
-    fontFamily: 'Lexend_700Bold',
-    fontSize: 22,
-    color: Colors.primary,
-    letterSpacing: 1,
   },
   playedDot: {
     width: 8,
@@ -404,15 +457,21 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     borderRadius: 12,
-    marginBottom: 16,
+    marginBottom: 12,
   },
   feedbackText: {
     fontFamily: 'Lexend_600SemiBold',
     fontSize: 14,
   },
+  hint: {
+    fontFamily: 'Lexend_400Regular',
+    fontSize: 13,
+    color: Colors.slate500,
+    textAlign: 'center',
+    marginBottom: 12,
+  },
   answerSection: {
     gap: 12,
-    marginBottom: 20,
   },
   answerBtn: {
     flexDirection: 'row',
@@ -440,69 +499,6 @@ const styles = StyleSheet.create({
     fontFamily: 'Lexend_700Bold',
     fontSize: 17,
     color: '#fff',
-  },
-  noiseSection: {
-    borderTopWidth: 1,
-    borderTopColor: Colors.slate200,
-    paddingTop: 16,
-  },
-  noiseHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 10,
-  },
-  noiseHeaderLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  noiseLabel: {
-    fontFamily: 'Lexend_500Medium',
-    fontSize: 13,
-    color: Colors.slate600,
-  },
-  noiseBadge: {
-    backgroundColor: `${Colors.primary}18`,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 20,
-  },
-  noiseBadgeText: {
-    fontFamily: 'Lexend_700Bold',
-    fontSize: 11,
-    color: Colors.primary,
-  },
-  noiseControls: {
-    flexDirection: 'row',
-    backgroundColor: Colors.surfaceLight,
-    borderRadius: 12,
-    padding: 4,
-    borderWidth: 1,
-    borderColor: Colors.slate200,
-  },
-  noiseBtn: {
-    flex: 1,
-    paddingVertical: 8,
-    alignItems: 'center',
-    borderRadius: 9,
-  },
-  noiseBtnActive: {
-    backgroundColor: `${Colors.primary}18`,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.06,
-    shadowRadius: 2,
-    elevation: 1,
-  },
-  noiseBtnText: {
-    fontFamily: 'Lexend_500Medium',
-    fontSize: 12,
-    color: Colors.slate500,
-  },
-  noiseBtnTextActive: {
-    fontFamily: 'Lexend_700Bold',
-    color: Colors.primary,
   },
   doneContainer: {
     flex: 1,
@@ -540,6 +536,12 @@ const styles = StyleSheet.create({
     fontFamily: 'Lexend_500Medium',
     fontSize: 12,
     color: Colors.slate500,
+  },
+  levelCopy: {
+    fontFamily: 'Lexend_500Medium',
+    fontSize: 15,
+    color: Colors.slate600,
+    textAlign: 'center',
   },
   doneBtn: {
     backgroundColor: Colors.primary,

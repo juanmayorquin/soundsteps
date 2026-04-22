@@ -1,5 +1,4 @@
 import { MaterialIcons } from '@expo/vector-icons';
-import { Audio } from 'expo-av';
 import { router } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -11,104 +10,129 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors } from '../../constants/Colors';
-import { DETECTION_SOUNDS } from '../../constants/AudioContent';
+import { DETECTION_LEVELS } from '../../constants/AudioContent';
+import { useAudio } from '../../hooks/useAudio';
 import { useProgress } from '../../hooks/useProgress';
+import { generateDetectionTrials, computeNextLevel, type DetectionTrial } from '../../lib/trials';
+import type { Level } from '../../constants/Modules';
 
-type FeedbackState = 'idle' | 'correct' | 'incorrect';
+type Phase = 'idle' | 'playing' | 'waitingAnswer' | 'feedback' | 'done';
 
-const TOTAL = DETECTION_SOUNDS.length;
+const SESSION_TRIAL_COUNT = 10;
 
 export default function DetectionScreen() {
-  const [current, setCurrent] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [hasPlayed, setHasPlayed] = useState(false);
-  const [feedback, setFeedback] = useState<FeedbackState>('idle');
-  const [score, setScore] = useState(0);
-  const [done, setDone] = useState(false);
-  const soundRef = useRef<Audio.Sound | null>(null);
-  const waveAnim = useRef(new Animated.Value(0)).current;
-  const feedbackAnim = useRef(new Animated.Value(0)).current;
-  const { recordSession } = useProgress();
-  const startTime = useRef(Date.now());
-  const correctCount = useRef(0);
+  const { progress, loading, logTrial, updateLevel, recordSession } = useProgress();
+  const { play, playFeedback, stop, isPlaying } = useAudio();
 
-  useEffect(() => {
-    Audio.setAudioModeAsync({ playsInSilentModeIOS: true });
-    return () => { soundRef.current?.unloadAsync(); };
+  const currentLevel = progress.modules.detection.currentLevel as Level;
+  const [trials, setTrials] = useState<DetectionTrial[]>([]);
+  const [trialIndex, setTrialIndex] = useState(0);
+  const [phase, setPhase] = useState<Phase>('idle');
+  const [score, setScore] = useState(0);
+  const [lastCorrect, setLastCorrect] = useState<boolean | null>(null);
+  const [levelChange, setLevelChange] = useState<'promoted' | 'demoted' | 'same'>('same');
+  const [nextLevel, setNextLevel] = useState<Level>(currentLevel);
+
+  const scoreRef = useRef(0);
+  const startTime = useRef(Date.now());
+  const feedbackAnim = useRef(new Animated.Value(0)).current;
+  const phaseRef = useRef<Phase>('idle');
+
+  const setPhaseTracked = useCallback((p: Phase) => {
+    phaseRef.current = p;
+    setPhase(p);
   }, []);
 
-  const animateWave = useCallback(() => {
-    Animated.loop(
-      Animated.sequence([
-        Animated.timing(waveAnim, { toValue: 1, duration: 600, useNativeDriver: true }),
-        Animated.timing(waveAnim, { toValue: 0, duration: 600, useNativeDriver: true }),
-      ])
-    ).start();
-  }, [waveAnim]);
-
-  const stopWave = useCallback(() => {
-    waveAnim.stopAnimation();
-    waveAnim.setValue(0);
-  }, [waveAnim]);
-
-  const playSound = useCallback(async () => {
-    if (isPlaying) return;
-    try {
-      if (soundRef.current) {
-        await soundRef.current.unloadAsync();
-        soundRef.current = null;
-      }
-      const { sound } = await Audio.Sound.createAsync(DETECTION_SOUNDS[current].file);
-      soundRef.current = sound;
-      setIsPlaying(true);
-      animateWave();
-      sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.isLoaded && status.didJustFinish) {
-          setIsPlaying(false);
-          setHasPlayed(true);
-          stopWave();
-        }
-      });
-      await sound.playAsync();
-    } catch (e) {
-      setIsPlaying(false);
-      setHasPlayed(true);
-      stopWave();
+  // Generate trials on mount (after loading completes)
+  useEffect(() => {
+    if (!loading) {
+      const generated = generateDetectionTrials(currentLevel);
+      setTrials(generated);
+      scoreRef.current = 0;
+      startTime.current = Date.now();
     }
-  }, [current, isPlaying, animateWave, stopWave]);
+  }, [loading]);
 
-  const showFeedback = useCallback((state: FeedbackState) => {
-    setFeedback(state);
+  const currentTrial = trials[trialIndex];
+
+  const animateFeedback = useCallback(() => {
     feedbackAnim.setValue(0);
     Animated.timing(feedbackAnim, { toValue: 1, duration: 300, useNativeDriver: true }).start();
-    setTimeout(() => {
-      const next = current + 1;
-      if (next >= TOTAL) {
+  }, [feedbackAnim]);
+
+  const handlePlay = useCallback(async () => {
+    if (phaseRef.current === 'playing' || isPlaying) return;
+    setPhaseTracked('playing');
+    await play(currentTrial.file);
+    if ((phaseRef.current as Phase) === 'playing') {
+      setPhaseTracked('waitingAnswer');
+    } else {
+      // handleResponse won the race — stop the audio that just started
+      stop();
+    }
+  }, [isPlaying, play, currentTrial, setPhaseTracked, stop]);
+
+  const handleResponse = useCallback(async (response: 'heard' | 'not-heard') => {
+    if (phaseRef.current !== 'waitingAnswer') return;
+
+    const correct =
+      (response === 'heard' && !currentTrial.isSilence) ||
+      (response === 'not-heard' && currentTrial.isSilence);
+
+    if (correct) {
+      scoreRef.current += 1;
+      setScore((s) => s + 1);
+    }
+    setLastCorrect(correct);
+
+    // Lock the UI immediately via ref — blocks handlePlay continuation even before re-render
+    setPhaseTracked('feedback');
+    animateFeedback();
+    playFeedback(correct ? 'correct' : 'incorrect');
+
+    // Log trial
+    await logTrial('detection', {
+      stimulusId: currentTrial.stimulusId,
+      level: currentLevel,
+      noiseVolume: DETECTION_LEVELS[currentLevel].noiseVolume,
+      response,
+      correct,
+      timestamp: Date.now(),
+    });
+
+    setTimeout(async () => {
+      const nextIndex = trialIndex + 1;
+      if (nextIndex >= SESSION_TRIAL_COUNT) {
+        // Session done
+        const result = computeNextLevel(currentLevel, scoreRef.current);
+        setLevelChange(result.changed);
+        setNextLevel(result.nextLevel);
+        await updateLevel('detection', result.nextLevel);
         const minutes = Math.ceil((Date.now() - startTime.current) / 60000);
-        recordSession('detection', correctCount.current, TOTAL, minutes);
-        setDone(true);
+        await recordSession('detection', scoreRef.current, SESSION_TRIAL_COUNT, minutes);
+        setPhaseTracked('done');
       } else {
-        setCurrent(next);
-        setFeedback('idle');
-        setHasPlayed(false);
+        setTrialIndex(nextIndex);
+        setPhaseTracked('idle');
+        setLastCorrect(null);
       }
     }, 1200);
-  }, [current, recordSession]);
+  }, [
+    currentTrial, currentLevel, trialIndex,
+    logTrial, playFeedback, updateLevel, recordSession, animateFeedback, setPhaseTracked,
+  ]);
 
-  const handleHeard = useCallback(() => {
-    if (feedback !== 'idle') return;
-    correctCount.current += 1;
-    setScore((s) => s + 1);
-    showFeedback('correct');
-  }, [feedback, showFeedback]);
+  if (loading || trials.length === 0) {
+    return <SafeAreaView style={styles.container} />;
+  }
 
-  const handleNotHeard = useCallback(() => {
-    if (feedback !== 'idle') return;
-    showFeedback('incorrect');
-  }, [feedback, showFeedback]);
+  if (phase === 'done') {
+    const pct = Math.round((scoreRef.current / SESSION_TRIAL_COUNT) * 100);
+    const levelCopy =
+      levelChange === 'promoted' ? `¡Subiste a Nivel ${nextLevel}!` :
+      levelChange === 'demoted'  ? `Ajustamos a Nivel ${nextLevel} para que practiques mejor.` :
+      `Mantuviste Nivel ${nextLevel}.`;
 
-  if (done) {
-    const pct = Math.round((score / TOTAL) * 100);
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.doneContainer}>
@@ -116,11 +140,12 @@ export default function DetectionScreen() {
             <MaterialIcons name="check-circle" size={64} color={Colors.green500} />
           </View>
           <Text style={styles.doneTitle}>¡Sesión completada!</Text>
-          <Text style={styles.doneSubtitle}>Acertaste {score} de {TOTAL}</Text>
+          <Text style={styles.doneSubtitle}>Acertaste {scoreRef.current} de {SESSION_TRIAL_COUNT}</Text>
           <View style={styles.doneScore}>
             <Text style={styles.doneScoreNumber}>{pct}%</Text>
             <Text style={styles.doneScoreLabel}>Precisión</Text>
           </View>
+          <Text style={styles.levelCopy}>{levelCopy}</Text>
           <TouchableOpacity style={styles.doneBtn} onPress={() => router.back()}>
             <Text style={styles.doneBtnText}>Volver al inicio</Text>
           </TouchableOpacity>
@@ -129,10 +154,9 @@ export default function DetectionScreen() {
     );
   }
 
-  const sound = DETECTION_SOUNDS[current];
-  const feedbackColor = feedback === 'correct' ? Colors.green500 : feedback === 'incorrect' ? Colors.red400 : Colors.primary;
-
-  const waveScale = waveAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.08] });
+  const canAnswer = phase === 'waitingAnswer' && !isPlaying;
+  const canPlay = phase === 'idle' || phase === 'waitingAnswer';
+  const hasPlayed = phase === 'waitingAnswer' || phase === 'feedback';
 
   return (
     <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
@@ -145,70 +169,101 @@ export default function DetectionScreen() {
         <View style={styles.backBtn} />
       </View>
 
-      {/* Progress */}
+      {/* Progress bar */}
       <View style={styles.progressContainer}>
-        {DETECTION_SOUNDS.map((_, i) => (
+        {Array.from({ length: SESSION_TRIAL_COUNT }).map((_, i) => (
           <View
             key={i}
             style={[
               styles.progressSegment,
-              i < current ? styles.progressDone : i === current ? styles.progressActive : styles.progressInactive,
+              i < trialIndex
+                ? styles.progressDone
+                : i === trialIndex
+                  ? styles.progressActive
+                  : styles.progressInactive,
             ]}
           />
         ))}
       </View>
 
-      {/* Main */}
+      {/* Main content */}
       <View style={styles.main}>
         <Text style={styles.mainTitle}>Escuchá con atención</Text>
 
-        <Animated.View style={[styles.speakerCard, { transform: [{ scale: waveScale }] }]}>
+        {/* Level chip */}
+        <View style={styles.levelChip}>
+          <Text style={styles.levelChipText}>Nivel {currentLevel}</Text>
+        </View>
+
+        {/* Sound card */}
+        <View style={styles.speakerCard}>
           <View style={styles.speakerBg} />
           <View style={styles.speakerBgBlob1} />
           <View style={styles.speakerBgBlob2} />
           <View style={styles.speakerIconWrap}>
-            <MaterialIcons name="volume-up" size={64} color={Colors.primary} />
-          </View>
-          <View style={styles.waveform}>
-            {[4, 8, 5, 10, 6, 12, 8, 4, 7, 3].map((h, i) => (
-              <Animated.View
-                key={i}
-                style={[
-                  styles.waveBar,
-                  { height: h * 2 },
-                  isPlaying && { opacity: waveAnim.interpolate({ inputRange: [0, 1], outputRange: [0.4, 1] }) },
-                ]}
-              />
-            ))}
-          </View>
-          <TouchableOpacity style={styles.playBtn} onPress={playSound} activeOpacity={0.85}>
-            <MaterialIcons name="play-arrow" size={20} color="#fff" />
-            <Text style={styles.playBtnText}>{hasPlayed ? 'Reproducir de nuevo' : 'Reproducir sonido'}</Text>
-          </TouchableOpacity>
-        </Animated.View>
-
-        {feedback !== 'idle' ? (
-          <Animated.View style={[styles.feedbackBanner, { opacity: feedbackAnim, backgroundColor: feedback === 'correct' ? '#dcfce7' : '#fee2e2' }]}>
             <MaterialIcons
-              name={feedback === 'correct' ? 'check-circle' : 'cancel'}
-              size={20}
-              color={feedback === 'correct' ? Colors.green500 : Colors.red400}
+              name={phase === 'playing' ? 'volume-up' : 'hearing'}
+              size={64}
+              color={Colors.primary}
             />
-            <Text style={[styles.feedbackText, { color: feedback === 'correct' ? Colors.green500 : Colors.red400 }]}>
-              {feedback === 'correct' ? '¡Muy bien!' : 'Vamos con el siguiente.'}
+          </View>
+          <TouchableOpacity
+            style={[styles.playBtn, (!canPlay || isPlaying) && styles.playBtnDisabled]}
+            onPress={handlePlay}
+            disabled={!canPlay || isPlaying}
+            activeOpacity={0.85}
+          >
+            <MaterialIcons name="play-arrow" size={20} color="#fff" />
+            <Text style={styles.playBtnText}>
+              {hasPlayed ? 'Reproducir de nuevo' : 'Reproducir sonido'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Feedback banner */}
+        {phase === 'feedback' ? (
+          <Animated.View
+            style={[
+              styles.feedbackBanner,
+              {
+                opacity: feedbackAnim,
+                backgroundColor: lastCorrect ? '#dcfce7' : '#fee2e2',
+              },
+            ]}
+          >
+            <MaterialIcons
+              name={lastCorrect ? 'check-circle' : 'cancel'}
+              size={20}
+              color={lastCorrect ? Colors.green500 : Colors.red400}
+            />
+            <Text
+              style={[
+                styles.feedbackText,
+                { color: lastCorrect ? Colors.green500 : Colors.red400 },
+              ]}
+            >
+              {lastCorrect ? '¡Muy bien!' : 'Vamos con el siguiente.'}
             </Text>
           </Animated.View>
         ) : (
-          <Text style={styles.hint}>{hasPlayed ? '¿Lo escuchaste?' : 'Tocá el botón para escuchar el sonido'}</Text>
+          <Text style={styles.hint}>
+            {canAnswer
+              ? '¿Lo escuchaste?'
+              : 'Tocá el botón para escuchar el sonido'}
+          </Text>
         )}
       </View>
 
-      {/* Action Buttons */}
+      {/* Action buttons */}
       <View style={styles.actions}>
         <TouchableOpacity
-          style={[styles.actionBtn, styles.actionBtnPrimary, !hasPlayed && styles.actionBtnDisabled]}
-          onPress={handleHeard}
-          disabled={!hasPlayed || feedback !== 'idle'}
+          style={[
+            styles.actionBtn,
+            styles.actionBtnPrimary,
+            !canAnswer && styles.actionBtnDisabled,
+          ]}
+          onPress={() => handleResponse('heard')}
+          disabled={!canAnswer}
           activeOpacity={0.85}
         >
           <View style={styles.actionIconWrap}>
@@ -219,9 +274,13 @@ export default function DetectionScreen() {
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.actionBtn, styles.actionBtnSecondary, !hasPlayed && styles.actionBtnDisabled]}
-          onPress={handleNotHeard}
-          disabled={!hasPlayed || feedback !== 'idle'}
+          style={[
+            styles.actionBtn,
+            styles.actionBtnSecondary,
+            !canAnswer && styles.actionBtnDisabled,
+          ]}
+          onPress={() => handleResponse('not-heard')}
+          disabled={!canAnswer}
           activeOpacity={0.85}
         >
           <View style={[styles.actionIconWrap, { backgroundColor: Colors.slate200 }]}>
@@ -276,18 +335,30 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     paddingHorizontal: 24,
-    paddingTop: 16,
+    paddingTop: 8,
   },
   mainTitle: {
     fontFamily: 'Lexend_700Bold',
-    fontSize: 30,
+    fontSize: 26,
     color: Colors.slate900,
-    marginBottom: 24,
+    marginBottom: 8,
+  },
+  levelChip: {
+    backgroundColor: `${Colors.primary}18`,
+    paddingHorizontal: 14,
+    paddingVertical: 5,
+    borderRadius: 20,
+    marginBottom: 20,
+  },
+  levelChipText: {
+    fontFamily: 'Lexend_600SemiBold',
+    fontSize: 13,
+    color: Colors.primary,
   },
   speakerCard: {
     width: '100%',
     aspectRatio: 1,
-    maxWidth: 320,
+    maxWidth: 300,
     backgroundColor: Colors.surfaceLight,
     borderRadius: 28,
     alignItems: 'center',
@@ -308,19 +379,15 @@ const styles = StyleSheet.create({
   },
   speakerBgBlob1: {
     position: 'absolute',
-    top: -30,
-    right: -30,
-    width: 100,
-    height: 100,
+    top: -30, right: -30,
+    width: 100, height: 100,
     borderRadius: 50,
     backgroundColor: `${Colors.primary}20`,
   },
   speakerBgBlob2: {
     position: 'absolute',
-    bottom: -30,
-    left: -30,
-    width: 120,
-    height: 120,
+    bottom: -30, left: -30,
+    width: 120, height: 120,
     borderRadius: 60,
     backgroundColor: `${Colors.primary}10`,
   },
@@ -328,19 +395,7 @@ const styles = StyleSheet.create({
     backgroundColor: `${Colors.primary}18`,
     padding: 20,
     borderRadius: 50,
-    marginBottom: 20,
-  },
-  waveform: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    marginBottom: 24,
-  },
-  waveBar: {
-    width: 6,
-    backgroundColor: Colors.primary,
-    borderRadius: 3,
-    opacity: 0.4,
+    marginBottom: 28,
   },
   playBtn: {
     flexDirection: 'row',
@@ -355,6 +410,9 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 8,
     elevation: 5,
+  },
+  playBtnDisabled: {
+    opacity: 0.5,
   },
   playBtnText: {
     fontFamily: 'Lexend_700Bold',
@@ -467,7 +525,7 @@ const styles = StyleSheet.create({
     borderColor: Colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 32,
+    marginBottom: 20,
   },
   doneScoreNumber: {
     fontFamily: 'Lexend_700Bold',
@@ -478,6 +536,14 @@ const styles = StyleSheet.create({
     fontFamily: 'Lexend_500Medium',
     fontSize: 12,
     color: Colors.slate500,
+  },
+  levelCopy: {
+    fontFamily: 'Lexend_600SemiBold',
+    fontSize: 15,
+    color: Colors.slate700,
+    textAlign: 'center',
+    marginBottom: 32,
+    paddingHorizontal: 16,
   },
   doneBtn: {
     backgroundColor: Colors.primary,
